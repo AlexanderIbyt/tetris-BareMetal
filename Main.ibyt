@@ -1,0 +1,997 @@
+// Tetris for ibytBMS (BareMetal) - graphics (VBE, 32 bit), PC speaker, own clock (PIT).
+// Controls: arrow left/right (A / D) move, arrow up (W) rotates, arrow down (S) falls faster, space = drop at once,
+// p = pause, q / ESC = quit, after the game ends r = new game.
+// The field is kept in Board (10 x 20 bytes, 0 = empty, otherwise colour number 1..7). Only fields that changed are drawn (Shown).
+//
+// Style of this version: registers carry names (@Bit, @Mask, @Cell ...), loops are loop, decisions are if / else.
+// A goto stays only where it is the clearest form: leaving a loop (Block) and the key dispatch (ReadKeys).
+
+ibyt_bare
+ibyt_labelcheck
+import <BasicBare.ibyt>
+import <Keyboard.ibyt>
+import <Bios.ibyt>
+import <Paging.ibyt>
+import <Vbe.ibyt>
+import <Gfx.ibyt>
+import <Clock.ibyt>
+
+// ================= SETTINGS (change here, then recompile) =================
+private define DROP_START:      800     // fall time in level 0, in ms
+private define DROP_MIN:        100     // fastest fall time, in ms
+private define DROP_STEP:       70      // so many ms faster per level
+private define LINES_PER_LEVEL: 10      // lines until the next level
+// ======================================================================================
+
+private define FIELD_W: 10
+private define FIELD_H: 20
+
+// Colour 0 = background, 1..7 = I J L O S T Z
+private int32 Pal[8]: {1317916, 55528, 3170544, 15767584, 15788064, 3199040, 11813088, 15283248}
+private int32 Shapes[28]: {3840, 8738, 240, 17476, 17600, 36352, 25664, 3616, 17504, 3712, 50240, 11776, 52224, 52224, 52224, 52224, 1728, 35904, 27648, 17952, 3648, 19520, 19968, 17984, 3168, 19584, 50688, 9792}
+private int64 Kick[5]: {0, -1, 1, -2, 2}                        // tries when rotating (wall kick)
+
+private byte Board[200]
+private byte Cur[200]
+private byte Shown[200]
+private byte TBuf[48]
+private byte NumBuf[24]
+
+// tetScreen: screen and playing field in pixels
+//   cell    side length of one field in pixels
+//   fieldX  top left corner of the playing field
+private int64 tetScreen{ cell: 32, width, height, fieldX, fieldY }
+
+// tetDraw: what is drawn at the moment: position, colour, text
+private int64 tetDraw{ x, y, cellColor, rgb, textLen, value }
+
+// tetPiece: the falling piece and the next one
+private int64 tetPiece{ kind, rot, x, y, nextKind }
+
+// tetTry: the piece that is tried (Fits, TryMove)
+private int64 tetTry{ kind, x, y, rot, hit }
+
+// tetGame: score, level, timing and game state
+private int64 tetGame{ lp, row, cleared, score, best, lines, level, dropMs, nextDrop, quit, paused, over, hudDirty: 1 }
+
+// ---------------------------------------------------------------- Drawing
+
+// Set colour Rgb
+private methode SetCol(keep temp, keep work, keep index, keep counter, keep slot, keep value, keep unit, base){
+    prepare $base: tetDraw.rgb call Gfx.Color(=)
+}
+
+// Draw one field at pixel position (DX, DY) in colour number CC: border in half brightness, the colour inside
+private methode DrawCell(base, temp, work, index, keep counter, keep slot, value, keep unit, item, admin){
+    $index@Color: tetDraw.cellColor
+    $base@Rgb: Pal[@Color]
+    tetDraw.rgb: @Rgb
+
+    if (@Color != 0){
+        // border: the colour in half brightness
+        @Rgb >>: 1
+        @Rgb &: 8355711
+        tetDraw.rgb: @Rgb
+        call SetCol(=)
+
+        prepare $base@DrawX: tetDraw.x, $work@DrawY: tetDraw.y, $temp@Width: tetScreen.cell, $value@Height: tetScreen.cell
+        call Gfx.Fill(=)
+
+        // inside: the full colour, inset by 2 pixels
+        $index@Color: tetDraw.cellColor
+        $base@Rgb: Pal[@Color]
+        tetDraw.rgb: @Rgb
+        call SetCol(=)
+
+        $base@DrawX: tetDraw.x
+        @DrawX +: 2
+        $work@DrawY: tetDraw.y
+        @DrawY +: 2
+        $temp@Width: tetScreen.cell
+        @Width -: 4
+        prepare @DrawX, @DrawY, @Width, $value@Height: @Width
+        call Gfx.Fill(=)
+    } else {
+        // empty field: one area in the background colour
+        call SetCol(=)
+        prepare $base@DrawX: tetDraw.x, $work@DrawY: tetDraw.y, $temp@Width: tetScreen.cell, $value@Height: tetScreen.cell
+        call Gfx.Fill(=)
+    }
+}
+
+// Fill a rectangle (DX, DY, $temp wide, $value high) in colour Rgb
+prepare $temp@Width, $value@Height
+private methode Box(base, temp, work, index, counter, slot, value, unit, item, admin){
+    $unit: @Width
+    $index: @Height
+    call SetCol(=)
+
+    prepare $base: tetDraw.x, $work: tetDraw.y, $temp: $unit, $value: $index
+    call Gfx.Fill(=)
+}
+
+// Write the text in TBuf at position (DX, DY), colour Rgb
+private methode DrawText(_, base, temp, work, index, counter, slot, value, unit){
+    call SetCol(=)
+
+    prepare $base: tetDraw.x, $work: tetDraw.y, $pTemp: TBuf
+    call Gfx.Text(=)
+}
+
+
+// Append text ($pBase) to TBuf
+private methode TPut(_, base@Text, temp, work, index, counter, keep slot, value, unit){
+    $value@Pos: 0
+    $index@Len: tetDraw.textLen
+
+    _: $pBase@Text[ @Pos ]
+    loop (_ != 0){
+        TBuf[@Len]: _
+        @Len++
+        @Pos++
+        _: $pBase@Text[ @Pos ]
+    }
+
+    _: 0
+    TBuf[@Len]: _
+    tetDraw.textLen: @Len
+}
+
+// Append the number Val as text to TBuf
+private methode TNum(_, base, temp, work, index, counter, slot, value, unit){
+    $work@Val: tetDraw.value
+    $value@Digits: 0
+
+    // Digits from back to front. At least one, also for 0: that is why the test comes last.
+    ->Digit->
+        $base: @Val
+        $base %: 10
+        $base +: 48
+        _: $base
+        NumBuf[@Digits]: _
+        @Digits++
+        @Val /: 10
+        compare(@Val != 0) goto_true Digit↑
+
+    // and append them to TBuf in the right order
+    $index@Len: tetDraw.textLen
+    loop (@Digits != 0){
+        @Digits--
+        _: NumBuf[@Digits]
+        TBuf[@Len]: _
+        @Len++
+    }
+
+    _: 0
+    TBuf[@Len]: _
+    tetDraw.textLen: @Len
+}
+
+// Put all fields together from Board and the falling piece (Cur)
+private methode Compose(_, base, temp, work, index, counter, slot, value, unit){
+    $index@Cell: 0
+    loop (@Cell < 200){
+        _: Board[@Cell]
+        Cur[@Cell]: _
+        @Cell++
+    }
+
+    // The piece: 16 bits, bit 15 = top left
+    $index: tetPiece.kind
+    $index *: 4
+    $index +: tetPiece.rot
+    $unit@Mask: Shapes[$index]
+    $value@Bit: 0
+    loop (@Bit < 16){
+        $base: @Mask
+        $base &: 32768
+        if ($base != 0){
+            $base@X: @Bit
+            @X &: 3
+            @X +: tetPiece.x
+            $temp@Y: @Bit
+            @Y >>: 2
+            @Y +: tetPiece.y
+
+            // only fields inside the playing field
+            if (@X < FIELD_W and @Y < FIELD_H){
+                @Y *: FIELD_W
+                @Y +: @X
+                $work: tetPiece.kind
+                $work +: 1
+                _: $work
+                Cur[@Y]: _
+            }
+        }
+        @Mask <<: 1
+        @Bit++
+    }
+}
+
+// Draw changed fields
+private methode Render(base, temp, work, index, counter, slot, value, unit, item, admin){
+    call Compose(=)
+    $slot@Cell: 0
+
+    loop (@Cell < 200){
+        $index: @Cell
+        $work: Cur[$index]
+        $temp: Shown[$index]
+        if ($work != $temp){
+            _: $work
+            Shown[$index]: _
+            tetDraw.cellColor: $work
+
+            // pixel position: column = Cell % 10, row = Cell / 10
+            $base: @Cell
+            $base %: FIELD_W
+            $base *: tetScreen.cell
+            $base +: tetScreen.fieldX
+            tetDraw.x: $base
+            $base: @Cell
+            $base /: FIELD_W
+            $base *: tetScreen.cell
+            $base +: tetScreen.fieldY
+            tetDraw.y: $base
+            call DrawCell(=)
+        }
+        @Cell++
+    }
+}
+
+// Preview of the next piece right of the field (box 6 x 5 fields, piece 4 x 4 inside)
+private methode DrawPreview(base, temp, work, index, counter, slot, value, unit, item, admin){
+    // Box: 11 fields right of the field edge, 2 fields below, 6 wide and 5 high
+    tetDraw.rgb: 1317916
+    $base@BoxX: tetScreen.cell
+    @BoxX *: 11
+    @BoxX +: tetScreen.fieldX
+    tetDraw.x: @BoxX
+    $base@BoxY: tetScreen.cell
+    @BoxY *: 2
+    @BoxY +: tetScreen.fieldY
+    tetDraw.y: @BoxY
+    $temp@Width: tetScreen.cell
+    @Width *: 6
+    $value@Height: tetScreen.cell
+    @Height *: 5
+    prepare @Width, @Height call Box(=)
+
+    $index: tetPiece.nextKind
+    $index *: 4
+    $unit@Mask: Shapes[$index]
+    $slot@Bit: 0
+
+    loop (@Bit < 16){
+        $base@Test: @Mask
+        @Test &: 32768                   // bit 15 set: a field of the piece is here
+        if (@Test != 0){
+            // x = column in the piece * side length + 12 side lengths from the field edge
+            $base@PieceX: @Bit
+            @PieceX &: 3
+            @PieceX *: tetScreen.cell
+            $work@Offset: tetScreen.cell
+            @Offset *: 12
+            @PieceX +: @Offset
+            @PieceX +: tetScreen.fieldX
+            tetDraw.x: @PieceX
+
+            // y = row in the piece * side length + 3 side lengths from the field edge
+            $base@PieceY: @Bit
+            @PieceY >>: 2
+            @PieceY *: tetScreen.cell
+            $work@Offset: tetScreen.cell
+            @Offset *: 2
+            @PieceY +: @Offset
+            @PieceY +: tetScreen.fieldY
+            @PieceY +: tetScreen.cell
+            tetDraw.y: @PieceY
+
+            $index@Color: tetPiece.nextKind
+            @Color +: 1
+            tetDraw.cellColor: @Color
+            call DrawCell(=)
+        }
+        @Mask <<: 1
+        @Bit++
+    }
+}
+
+// Display row $work: background box
+prepare $work@Row
+private methode HudBox(base, temp, work, index, counter, slot, value, unit, item, admin){
+    $unit@Offset: @Row
+    @Offset *: 24                        // every row is 24 pixels high
+    tetDraw.rgb: 1317916
+    $base@BoxX: tetScreen.cell
+    @BoxX *: 11
+    @BoxX +: tetScreen.fieldX
+    tetDraw.x: @BoxX
+    $base@BoxY: tetScreen.cell
+    @BoxY *: 9
+    @BoxY +: tetScreen.fieldY
+    @BoxY +: @Offset
+    tetDraw.y: @BoxY
+    $temp@Width: tetScreen.cell
+    @Width *: 6
+    prepare @Width, $value@Height: 20 call Box(=)
+}
+
+// Text ($pBase), then the number Val if $value = 1
+private methode HudText(_, base, temp, work, index, counter, slot, value@WithNumber, unit){
+    $slot@Numbered: @WithNumber
+    tetDraw.textLen: 0
+    call TPut(=)
+    if (@Numbered != 0){
+        call TNum(=)
+    }
+
+    tetDraw.rgb: 15790320
+    call DrawText(=)
+}
+
+private methode DrawHud(base, temp, work, index, counter, slot, value, unit, item, admin){
+    tetGame.hudDirty: 0
+
+    prepare $work: 0 call HudBox(=)
+
+    $pBase: "SCORE "
+    tetDraw.value: tetGame.score
+    $value: 1
+    call HudText(=)
+
+    prepare $work: 1 call HudBox(=)
+
+    $pBase: "LINES "
+    tetDraw.value: tetGame.lines
+    $value: 1
+    call HudText(=)
+
+    prepare $work: 2 call HudBox(=)
+
+    $pBase: "LEVEL "
+    tetDraw.value: tetGame.level
+    $value: 1
+    call HudText(=)
+
+    prepare $work: 3 call HudBox(=)
+
+    $pBase: "BEST  "
+    tetDraw.value: tetGame.best
+    $value: 1
+    call HudText(=)
+
+    prepare $work: 5 call HudBox(=)
+
+    $pBase: "p pause  q quit"
+    $value: 0
+    call HudText(=)
+}
+
+// ---------------------------------------------------------------- Game
+
+// Does the piece (TT, TR) fit at position (TX, TY)? Hit = 1: no
+private methode Fits(_, base, temp, work, index, counter, keep slot, value, unit){
+    tetTry.hit: 0
+    $index: tetTry.kind
+    $index *: 4
+    $index +: tetTry.rot
+    $unit@Mask: Shapes[$index]
+    $value@Bit: 0
+
+    loop (@Bit < 16){
+        $base: @Mask
+        $base &: 32768
+        if ($base != 0){
+            $base@X: @Bit
+            @X &: 3
+            @X +: tetTry.x
+            $temp@Y: @Bit
+            @Y >>: 2
+            @Y +: tetTry.y
+
+            // outside the field: the piece does not fit
+            if (@X >= FIELD_W or @Y >= FIELD_H){
+                goto Block↓
+            }
+
+            // already occupied: the piece does not fit
+            @Y *: FIELD_W
+            @Y +: @X
+            _: Board[@Y]
+            if (_ != 0){
+                goto Block↓
+            }
+        }
+        @Mask <<: 1
+        @Bit++
+    }
+    return
+
+    ->Block->
+        tetTry.hit: 1
+}
+
+// Try a piece: (TX, TY, TR). If it works, it counts from now on (Hit = 0), otherwise everything stays (Hit = 1)
+private methode TryMove(_, base, temp, work, index, counter, keep slot, value, unit){
+    tetTry.kind: tetPiece.kind
+    call Fits(=)
+
+    $base: tetTry.hit
+    if ($base = 0){
+        $base: tetTry.x
+        tetPiece.x: $base
+        $base: tetTry.y
+        tetPiece.y: $base
+        $base: tetTry.rot
+        tetPiece.rot: $base
+    }
+}
+
+// Get a new piece. If it does not fit, the game is over
+private methode Spawn(base, temp, work, index, counter, slot, value, unit, item, admin){
+    $base: tetPiece.nextKind
+    tetPiece.kind: $base
+    tetPiece.rot: 0
+    tetPiece.x: 3
+    tetPiece.y: 0
+    prepare $base: 7 call Clock.Rand(=)
+
+    $base: $counter@Random
+    tetPiece.nextKind: $base
+    tetTry.kind: tetPiece.kind
+    tetTry.x: 3
+    tetTry.y: 0
+    tetTry.rot: 0
+    call Fits(=)
+
+    $base: tetTry.hit
+    tetGame.over: $base
+    call DrawPreview(=)
+}
+
+// Put the piece into the board
+private methode PutPiece(_, base, temp, work, index, counter, slot, value, unit){
+    $index: tetPiece.kind
+    $index *: 4
+    $index +: tetPiece.rot
+    $unit@Mask: Shapes[$index]
+    $value@Bit: 0
+
+    loop (@Bit < 16){
+        $base: @Mask
+        $base &: 32768
+        if ($base != 0){
+            $base@X: @Bit
+            @X &: 3
+            @X +: tetPiece.x
+            $temp@Y: @Bit
+            @Y >>: 2
+            @Y +: tetPiece.y
+            @Y *: FIELD_W
+            @Y +: @X
+            $work: tetPiece.kind
+            $work +: 1
+            _: $work
+            Board[@Y]: _
+        }
+        @Mask <<: 1
+        @Bit++
+    }
+}
+
+// Remove full rows, Cleared = number
+// Every row is checked from bottom to top. If it is full, everything above moves down one row
+// and the same row is checked again. If it is not full, go one row up.
+private methode ClearLines(_, base, temp, work, index, counter, slot, value, unit){
+    tetGame.cleared: 0
+    $counter@Row: 19
+    $temp@Left: 20                       // this many rows are still to be checked
+
+    loop (@Left != 0){
+        // Is the row full? The first empty field means no.
+        $index@Cell: @Row
+        @Cell *: FIELD_W
+        $value@Col: 0
+        $work@Full: 1
+        loop (@Col < FIELD_W and @Full = 1){
+            _: Board[@Cell]
+            if (_ = 0){
+                @Full: 0
+            }
+            @Cell++
+            @Col++
+        }
+
+        if (@Full = 1){
+            $base: tetGame.cleared
+            $base +: 1
+            tetGame.cleared: $base
+
+            // copy everything above the row down by one row
+            $slot@Up: @Row
+            loop (@Up != 0){
+                $index@Dst: @Up
+                @Dst *: FIELD_W
+                $unit@Src: @Dst
+                @Src -: FIELD_W
+                $value@Col: 0
+                loop (@Col < FIELD_W){
+                    _: Board[@Src]
+                    Board[@Dst]: _
+                    @Dst++
+                    @Src++
+                    @Col++
+                }
+                @Up--
+            }
+
+            // clear the top row
+            $index@Cell: 0
+            _: 0
+            loop (@Cell < FIELD_W){
+                Board[@Cell]: _
+                @Cell++
+            }
+        } else {
+            @Row--
+            @Left--
+        }
+    }
+}
+
+// Sound: $base = Hz, $work = ms
+prepare $base@Hz, $work@Ms
+private methode Beep(_, base, temp, work, index, counter, slot, value, unit){
+    prepare $base, $work call Clock.Tone(=)
+}
+
+// Piece has landed: rows, points, level, next piece
+private methode Lock(base, temp, work, index, counter, slot, value, unit, item, admin){
+    call PutPiece(=)
+    call ClearLines(=)
+
+    $base: tetGame.cleared
+    if ($base = 0){
+        prepare $base: 196, $work: 30 call Beep(=)
+    } else {
+        // Points by number of rows: 1 = 100, 2 = 300, 3 = 500, 4 = 800
+        $work@Points: 800
+        if ($base = 1){
+            @Points: 100
+        }
+        if ($base = 2){
+            @Points: 300
+        }
+        if ($base = 3){
+            @Points: 500
+        }
+        $base: tetGame.level
+        $base +: 1
+        @Points *: $base
+        $base: tetGame.score
+        $base +: @Points
+        tetGame.score: $base
+        $work: tetGame.best
+        if ($base > $work){
+            tetGame.best: $base
+        }
+
+        // Lines, level and fall time
+        $base: tetGame.lines
+        $base +: tetGame.cleared
+        tetGame.lines: $base
+        $base /: LINES_PER_LEVEL
+        tetGame.level: $base
+        $work: tetGame.level
+        $work *: DROP_STEP
+        $base: DROP_START
+        $base -: $work
+        if ($base < DROP_MIN){
+            $base: DROP_MIN
+        }
+        tetGame.dropMs: $base@Drop
+
+        prepare $base: 523, $work: 60 call Beep(=)
+        prepare $base: 659, $work: 60 call Beep(=)
+
+        // four rows at once: fanfare
+        $base: tetGame.cleared
+        if ($base >= 4){
+            prepare $base: 784, $work: 60 call Beep(=)
+            prepare $base: 1047, $work: 160 call Beep(=)
+        }
+    }
+
+    tetGame.hudDirty: 1
+    call Spawn(=)
+}
+
+// One step down. If the piece cannot move any more, it lands (Hit = 1)
+private methode Fall(base, temp, work, index, counter, slot, value, unit, item, admin){
+    $base: tetPiece.x
+    tetTry.x: $base
+    $base: tetPiece.rot
+    tetTry.rot: $base
+    $base: tetPiece.y
+    $base +: 1
+    tetTry.y: $base
+    call TryMove(=)
+
+    $base: tetTry.hit
+    if ($base != 0){
+        call Lock(=)
+        tetTry.hit: 1
+    }
+}
+
+// Rotate with wall kick: first without offset, then left, right, 2 left, 2 right (Kick)
+private methode Rotate(_, base, temp, work, index, counter, slot, value, unit){
+    $base: tetPiece.rot
+    $base +: 1
+    $base &: 3
+    tetTry.rot: $base
+    $base: tetPiece.y
+    tetTry.y: $base
+    $slot@Try: 0
+
+    loop (@Try < 5){
+        $index: @Try
+        $base: Kick[$index]
+        $base +: tetPiece.x
+        tetTry.x: $base
+        call TryMove(=)
+
+        $base: tetTry.hit
+        if ($base = 0){
+            @Try: 5                      // it fits: end the loop
+        } else {
+            @Try++
+        }
+    }
+}
+
+// Redraw all fields
+private methode ForceRedraw(_, base, temp, work, index, counter, slot, value, unit){
+    $index@Cell: 0
+    _: 255
+
+    loop (@Cell < 200){
+        Shown[@Cell]: _
+        @Cell++
+    }
+}
+
+// Read keys
+private methode ReadKeys(base, temp, work, index, counter, slot, value, unit, item, admin){
+    ->Next->
+        call Keyboard.TryKey(=)
+        goto_flag not_carry Done
+
+        compare($base@Key = 113) goto_true Q
+        compare(@Key = 27) goto_true Q
+        compare(@Key = 112) goto_true Pause
+        $work: tetGame.paused
+        compare($work = 1) goto_true Next↑
+        compare(@Key = 258) goto_true Left
+        compare(@Key = 97) goto_true Left
+        compare(@Key = 259) goto_true Right
+        compare(@Key = 100) goto_true Right
+        compare(@Key = 256) goto_true Turn
+        compare(@Key = 119) goto_true Turn
+        compare(@Key = 257) goto_true Down
+        compare(@Key = 115) goto_true Down
+        compare(@Key = 32) goto_true HardDrop
+        goto Next↑
+
+    ->Q->
+        tetGame.quit: 1
+        goto Next↑
+
+    ->Pause->
+        $base: tetGame.paused
+        $base ^: 1
+        tetGame.paused: $base
+        if ($base = 1){
+            // Pause on: put a box with the word PAUSE over the field
+            tetDraw.rgb: 1317916
+            $base@BoxX: tetScreen.cell
+            @BoxX *: 2
+            @BoxX +: tetScreen.fieldX
+            tetDraw.x: @BoxX
+            $base@BoxY: tetScreen.cell
+            @BoxY *: 9
+            @BoxY +: tetScreen.fieldY
+            tetDraw.y: @BoxY
+            $temp@Width: tetScreen.cell
+            @Width *: 6
+            prepare @Width, $value@Height: 20 call Box(=)
+            tetDraw.textLen: 0
+            $pBase: "PAUSE"
+            call TPut(=)
+            tetDraw.rgb: 16769024
+            call DrawText(=)
+        } else {
+            // Pause off: redraw the whole field
+            call ForceRedraw(=)
+        }
+        goto Next↑
+
+    ->Left->
+        $base: tetPiece.x
+        $base -: 1
+        goto Side
+
+    ->Right->
+        $base: tetPiece.x
+        $base +: 1
+
+    ->Side->
+        tetTry.x: $base@NewX
+        $base: tetPiece.rot
+        tetTry.rot: $base
+        $base: tetPiece.y
+        tetTry.y: $base
+        call TryMove(=)
+        goto Next↑
+
+    ->Turn->
+        call Rotate(=)
+        goto Next↑
+
+    ->Down->
+        call Fall(=)
+        $base: tetGame.score
+        $base +: 1
+        tetGame.score: $base
+        tetGame.hudDirty: 1
+        goto Next↑
+
+    ->HardDrop->
+        // fall until the piece lands
+        call Fall(=)
+        $base: tetTry.hit
+        loop ($base = 0){
+            call Fall(=)
+            $base: tetTry.hit
+        }
+        goto Next↑
+
+    ->Done->
+}
+
+// Background, frame, empty field
+private methode DrawBackground(base, temp, work, index, counter, slot, value, unit, item, admin){
+    tetDraw.rgb: 658216
+    call SetCol(=)
+    call Gfx.Clear(=)
+
+    // Frame: 6 pixels wider than the field on each side
+    tetDraw.rgb: 6316160
+    $base@BoxX: tetScreen.fieldX
+    @BoxX -: 6
+    tetDraw.x: @BoxX
+    $base@BoxY: tetScreen.fieldY
+    @BoxY -: 6
+    tetDraw.y: @BoxY
+    $temp@Width: tetScreen.cell
+    @Width *: 10
+    @Width +: 12
+    $value@Height: tetScreen.cell
+    @Height *: 20
+    @Height +: 12
+    prepare @Width, @Height call Box(=)
+
+    // the field itself: 10 x 20 fields
+    tetDraw.rgb: 1317916
+    $base@BoxX: tetScreen.fieldX
+    tetDraw.x: @BoxX
+    $base@BoxY: tetScreen.fieldY
+    tetDraw.y: @BoxY
+    $temp@Width: tetScreen.cell
+    @Width *: 10
+    $value@Height: tetScreen.cell
+    @Height *: 20
+    prepare @Width, @Height call Box(=)
+}
+
+// New game
+private methode NewGame(base, temp, work, index, counter, slot, value, unit, item, admin){
+    $index@Cell: 0
+    _: 0
+
+    loop (@Cell < 200){
+        Board[@Cell]: _
+        Shown[@Cell]: _
+        @Cell++
+    }
+
+    tetGame.score: 0
+    tetGame.lines: 0
+    tetGame.level: 0
+    tetGame.paused: 0
+    tetGame.over: 0
+    tetGame.quit: 0
+    tetGame.dropMs: DROP_START
+    tetGame.hudDirty: 1
+
+    call DrawBackground(=)
+
+    prepare $base: 7 call Clock.Rand(=)
+
+    $base: $counter@Random
+    tetPiece.nextKind: $base
+
+    call Spawn(=)
+    call Clock.Ms(=)
+
+    $base: _
+    $base +: tetGame.dropMs
+    tetGame.nextDrop: $base
+}
+
+// Show game over
+private methode ShowOver(base, temp, work, index, counter, slot, value, unit, item, admin){
+    tetDraw.rgb: 1317916
+    $base@BoxX: tetScreen.cell
+    @BoxX +: tetScreen.fieldX
+    tetDraw.x: @BoxX
+    $base@BoxY: tetScreen.cell
+    @BoxY *: 8
+    @BoxY +: tetScreen.fieldY
+    tetDraw.y: @BoxY
+
+    $temp@Width: tetScreen.cell
+    @Width *: 8
+    prepare @Width, $value@Height: 60 call Box(=)
+
+    tetDraw.textLen: 0
+    $pBase: "GAME OVER"
+    call TPut(=)
+
+    tetDraw.rgb: 15283248
+    $base: tetDraw.x
+    $base +: 8
+    tetDraw.x: $base
+    $base: tetDraw.y
+    $base +: 8
+    tetDraw.y: $base
+    call DrawText(=)
+
+    tetDraw.textLen: 0
+    $pBase: "r = new game"
+    call TPut(=)
+    tetDraw.rgb: 15790320
+    $base: tetDraw.y
+    $base +: 24
+    tetDraw.y: $base
+    call DrawText(=)
+
+    prepare $base: 392, $work: 150 call Beep(=)
+    prepare $base: 330, $work: 150 call Beep(=)
+    prepare $base: 262, $work: 300 call Beep(=)
+}
+
+// One step in the running game: does the piece fall now? Then draw. If the game is over, the end screen follows.
+private methode Step(base, temp, work, index, counter, slot, value, unit, item, admin){
+    call Clock.Ms(=)
+    $work: tetGame.nextDrop
+    if (_ >= $work){
+        $base: _
+        $base +: tetGame.dropMs
+        tetGame.nextDrop: $base
+        call Fall(=)
+    }
+
+    $base: tetGame.over
+    if ($base = 1){
+        call GameOverScreen(=)
+    } else {
+        call Render(=)
+        $base: tetGame.hudDirty
+        if ($base != 0){
+            call DrawHud(=)
+        }
+    }
+}
+
+// End screen, then wait: r = new game, q / ESC = quit
+private methode GameOverScreen(base, temp, work, index, counter, slot, value, unit, item, admin){
+    call Render(=)
+    call DrawHud(=)
+    call ShowOver(=)
+
+    $work@Wait: 1
+    loop (@Wait = 1){
+        call Clock.Pump(=)
+        call Keyboard.TryKey(=)
+        if_flag carry{
+            if ($base@Key = 114){
+                $work@Wait: 0                        // r: new game
+            } else {
+                if (@Key = 113 or @Key = 27){
+                    tetGame.quit: 1
+                    $work@Wait: 0                    // q / ESC: quit
+                } else {
+                    $work@Wait: 1                    // another key: keep waiting
+                }
+            }
+        } else {
+            $work@Wait: 1                            // no key: keep waiting
+        }
+    }
+
+    $base: tetGame.quit
+    if ($base = 0){
+        call NewGame(=)
+    }
+}
+
+Start{
+
+    call Keyboard.Init(=)
+
+    // Take the largest resolution that exists
+    prepare $base: 1024, $work: 768, $temp: 0x2800000 call Gfx.Open(=)
+    if_flag not_carry{
+        prepare $base: 800, $work: 600, $temp: 0x2800000 call Gfx.Open(=)
+        if_flag not_carry{
+            prepare $base: 640, $work: 480, $temp: 0x2800000 call Gfx.Open(=)
+            if_flag not_carry{
+                prepare $pBase: "No graphics mode with 32 bits per pixel available.\n" call BasicBare.Print(=)
+                exit
+            }
+        }
+    }
+
+    call Vbe.Width(=)
+    tetScreen.width: $counter@Width
+    call Vbe.Height(=)
+    tetScreen.height: $counter
+
+    // Side length of a field: height / 22, at most 40 pixels
+    $base: tetScreen.height
+    $base /: 22
+    if ($base > 40){
+        $base: 40
+    }
+    tetScreen.cell: $base@Cell
+
+    // Playing field in the middle: the same margin on the left and at the top
+    $base: tetScreen.cell
+    $base *: 17
+    $work: tetScreen.width
+    $work -: $base
+    $work /: 2
+    tetScreen.fieldX: $work
+    $base: tetScreen.cell
+    $base *: 20
+    $work: tetScreen.height
+    $work -: $base
+    $work /: 2
+    tetScreen.fieldY: $work
+
+    call Clock.Init(=)
+    call NewGame(=)
+
+    // Main loop, until q / ESC is pressed
+    $base@Quit: tetGame.quit
+    loop (@Quit = 0){
+        call Clock.Pump(=)
+        call ReadKeys(=)
+
+        $base: tetGame.quit
+        if ($base = 0){
+            $base: tetGame.paused
+            if ($base = 0){
+                call Step(=)
+            }
+        }
+
+        $base@Quit: tetGame.quit
+    }
+
+    call Clock.Silence(=)
+    call Gfx.Close(=)
+    exit
+}
